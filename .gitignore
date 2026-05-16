@@ -1,0 +1,8 @@
+*.exe
+*.test
+*.bin
+__pycache__/
+*.pyc
+.idea/
+.vscode/
+vendor/
