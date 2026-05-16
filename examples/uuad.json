@@ -1,0 +1,81 @@
+{
+    "log": {
+        "level": "info",
+        "timestamp": true
+    },
+    "http_clients": [
+        {
+            "tag": "uu-out",
+            "detour": "uu-out"
+        }
+    ],
+    "inbounds": [
+        {
+            "type": "tun",
+            "tag": "tun-in",
+            "address": [
+                "172.19.0.1/30"
+            ],
+            "auto_route": true,
+            "strict_route": true,
+            "stack": "system"
+        }
+    ],
+    "outbounds": [
+        {
+            "type": "uu",
+            "tag": "uu-out",
+            "server": "118.150.217.142",
+            "server_port": 8888,
+            "password": "ch0641ng"
+        },
+        {
+            "type": "direct",
+            "tag": "direct-out"
+        }
+    ],
+    "route": {
+        "auto_detect_interface": true,
+        "rules": [
+            {
+                "action": "sniff"
+            },
+            {
+                "protocol": "dns",
+                "action": "hijack-dns"
+            },
+            {
+                "rule_set": "geosite-category-ads-all",
+                "action": "reject"
+            },
+            {
+                "domain_suffix": [
+                    "doubleclick.net",
+                    "analytics.google.com"
+                ],
+                "action": "reject"
+            }
+        ],
+        "final": "uu-out",
+        "rule_set": [
+            {
+                "tag": "geosite-category-ads-all",
+                "type": "remote",
+                "format": "binary",
+                "url": "https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/geosite-category-ads-all.srs",
+                "http_client": "uu-out"
+            }
+        ]
+    },
+    "dns": {
+        "servers": [
+            {
+                "type": "tcp",
+                "tag": "google-dns",
+                "server": "8.8.8.8",
+                "server_port": 53
+            }
+        ],
+        "strategy": "ipv4_only"
+    }
+}
