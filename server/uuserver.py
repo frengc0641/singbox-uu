@@ -31,9 +31,11 @@ class RemoteServer:
     def __init__(self):
         self.udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.udp_sock.bind(LISTEN_ADDR)
-        self.udpqueRX = {}  # {session_id: tcp_socket}
+        self.udpqueRX = {}  # {session_id: queue}
         self.udpqueRXraw = queue.Queue()
         self.tcpsock_l = {}
+        self.udpsock_l = {} # {udp_socket: session_id}
+        self.udpsession_time = {} # {session_id: last_active_time}
         self.client_addr = None
         self.udpqueTX = queue.Queue()
         self.udptx_c = queue.Queue()
@@ -85,7 +87,7 @@ class RemoteServer:
                         pass
                     else:
                         self.encrypt_send_to_client(current_seq, session_id, msg_type, payload)
-                elif msg_type == 0 or msg_type == 1 or msg_type == 3 or msg_type == 4 or msg_type == 5:
+                elif msg_type == 0 or msg_type == 1 or msg_type == 3 or msg_type == 4 or msg_type == 5 or msg_type == 8:
                     current_seq = 0
                     self.encrypt_send_to_client(current_seq, session_id, msg_type, payload, False)
                 elif msg_type == 6: # Resend 
@@ -134,10 +136,10 @@ class RemoteServer:
         tcp_sock.settimeout(2)
         try:
             tcp_sock.connect((target_ip, target_port))
-            self.send_to_client(session_id, 0x02, b"\x05\x00" + os.urandom(random.randint(64, 1188)))
+            self.send_to_client(session_id, 0x08, b"\x05\x00" + os.urandom(random.randint(64, 1188)))
         except Exception as e:
             if DEBUG: print(f"handle_client: {e}")
-            self.send_to_client(session_id, 0x02, b"\x05\x01" + os.urandom(random.randint(64, 1188)))
+            self.send_to_client(session_id, 0x08, b"\x05\x01" + os.urandom(random.randint(64, 1188)))
             print(f"[{session_id}]\t[連線失敗]")
             return
         if DEBUG: print(f"[{session_id}]\t[Open] {target_ip}:{target_port}")
@@ -159,6 +161,93 @@ class RemoteServer:
         self.udpqueRX.pop(session_id, None)
         self.Client_change = 1        
         return
+
+    def decode_address_header(self, payload):
+        if len(payload) < 7: return None, 0
+        addr_type = payload[0]
+        if addr_type == 1: # IPv4
+            if len(payload) < 7: return None, 0
+            ip = socket.inet_ntoa(payload[1:5])
+            port = struct.unpack('!H', payload[5:7])[0]
+            return (ip, port), 7
+        elif addr_type == 4: # IPv6
+            if len(payload) < 19: return None, 0
+            ip = socket.inet_ntop(socket.AF_INET6, payload[1:17])
+            port = struct.unpack('!H', payload[17:19])[0]
+            return (ip, port), 19
+        elif addr_type == 3: # Domain
+            domain_len = payload[1]
+            if len(payload) < 2 + domain_len + 2: return None, 0
+            ip = payload[2:2+domain_len].decode()
+            port = struct.unpack('!H', payload[2+domain_len:2+domain_len+2])[0]
+            return (ip, port), 2 + domain_len + 2
+        return None, 0
+
+    def encode_address_header(self, addr):
+        ip, port = addr
+        try:
+            ip_bytes = socket.inet_aton(ip)
+            return b'\x01' + ip_bytes + struct.pack('!H', port)
+        except:
+            pass
+        try:
+            ip_bytes = socket.inet_pton(socket.AF_INET6, ip)
+            return b'\x04' + ip_bytes + struct.pack('!H', port)
+        except:
+            domain_bytes = ip.encode()
+            return b'\x03' + bytes([len(domain_bytes)]) + domain_bytes + struct.pack('!H', port)
+
+    def handle_udp_client(self, session_id):
+        udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.udpqueRX[session_id] = queue.Queue()
+        self.udpsock_l[udp_sock] = session_id
+        self.udpsession_time[session_id] = time.time()
+        self.Client_change = 1
+        if DEBUG: print(f"[{session_id}]\t[Open UDP Proxy]")
+        
+        while True:
+            try:
+                payload = self.udpqueRX[session_id].get(block=True, timeout=300) # 5 min timeout
+                if payload is None or session_id not in self.udpqueRX: break
+                
+                target_addr, header_len = self.decode_address_header(payload)
+                if target_addr is not None:
+                    actual_payload = payload[header_len:]
+                    self.udpsession_time[session_id] = time.time()
+                    udp_sock.sendto(actual_payload, target_addr)
+                    self.udpTX_Byte += len(actual_payload)
+            except Exception as e:
+                if DEBUG: print(f"handle_udp_client exception: {e}")
+                self.send_to_client(session_id, 0x03, os.urandom(random.randint(64, 1188)))
+                break
+                
+        self.udpqueRX.pop(session_id, None)
+        self.udpsock_l.pop(udp_sock, None)
+        self.udpsession_time.pop(session_id, None)
+        udp_sock.close()
+        self.Client_change = 1
+        return
+
+    def handle_to_Local_UDP(self):
+        while True:
+            if len(self.udpsock_l) > 0:
+                udprx_list = list(self.udpsock_l.keys())
+                if len(udprx_list) > 0:
+                    udpR_ready, _, _ = select.select(udprx_list, [], udprx_list, self.UDP_delay)
+                    for i_sock in udpR_ready:
+                        session_id = self.udpsock_l.get(i_sock)
+                        if session_id is None: continue
+                        try:
+                            data, addr = i_sock.recvfrom(self.mtu_udp * 2)
+                            if data:
+                                self.udpsession_time[session_id] = time.time()
+                                header = self.encode_address_header(addr)
+                                self.send_to_client(session_id, 0x02, header + data)
+                        except Exception as e:
+                            if DEBUG: print(f"handle_to_Local_UDP: {e}")
+                            pass
+            else:
+                time.sleep(0.1)
 
     def handle_to_Local(self):
         """讀取目標網站回傳的資料，轉發回 Client"""
@@ -295,6 +384,7 @@ class RemoteServer:
         threading.Thread(target=self.handle_speed_udptx, daemon=True).start()
         threading.Thread(target=self.handle_status, daemon=True).start()
         threading.Thread(target=self.handle_to_Local, daemon=True).start()
+        threading.Thread(target=self.handle_to_Local_UDP, daemon=True).start()
         threading.Thread(target=self.handle_lose, daemon=True).start()
         threading.Thread(target=self.recv_que, daemon=True).start()        
 
@@ -315,7 +405,7 @@ class RemoteServer:
             else:
                 msg_type = 0xFF
             if last_back != addr and msg_type != 0x00:
-                if self.client_addr is not None and msg_type in (0x01, 0x02, 0x03, 0x04, 0x05):
+                if self.client_addr is not None and msg_type in (0x01, 0x02, 0x03, 0x04, 0x05, 0x07):
                     self.client_addr = addr
                     last_back = addr
                     if DEBUG: print(f'[Client addr update]\t[{self.client_addr}]')
@@ -323,6 +413,8 @@ class RemoteServer:
                     msg_type = 0xFF
             if msg_type == 0x01: # New Connect
                 threading.Thread(target=self.handle_client, args=(session_id, payload), daemon=True).start()
+            elif msg_type == 0x07: # New UDP Connect
+                threading.Thread(target=self.handle_udp_client, args=(session_id,), daemon=True).start()
             elif msg_type == 0x02: # Data
                 if seq >= self.udpRX_seq:
                     self.udprecv_pack[seq] = [session_id,payload]

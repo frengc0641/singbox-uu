@@ -238,9 +238,39 @@ func (o *UUOutbound) DialContext(ctx context.Context, network string, destinatio
 	}, nil
 }
 
-// ListenPacket — UDP proxy not supported, only TCP tunneling.
+// ListenPacket implements UDP proxy over UU session
 func (o *UUOutbound) ListenPacket(ctx context.Context, destination M.Socksaddr) (net.PacketConn, error) {
-	return nil, fmt.Errorf("uu: UDP proxy not supported")
+	ctx, metadata := adapter.ExtendContext(ctx)
+	metadata.Outbound = o.Tag()
+	metadata.Destination = destination
+
+	o.logger.InfoContext(ctx, "outbound UDP proxy to ", destination)
+
+	if err := o.ensureTransport(ctx); err != nil {
+		return nil, fmt.Errorf("uu: transport connect failed: %w", err)
+	}
+
+	for i := 0; i < 50; i++ {
+		if o.transport.IsConnected() {
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	if !o.transport.IsConnected() {
+		return nil, fmt.Errorf("uu: server not connected after timeout")
+	}
+
+	sessionID := o.allocSessionID()
+	dataCh := o.transport.OpenSession(sessionID)
+
+	// Send new UDP session request (msg_type=0x07)
+	o.transport.SendControl(sessionID, MsgNewUDP, nil)
+
+	return &uuPacketConn{
+		transport: o.transport,
+		sessionID: sessionID,
+		dataCh:    dataCh,
+	}, nil
 }
 
 // ─── uuConn implements net.Conn over a UU session ───
@@ -316,3 +346,135 @@ func (c *uuConn) RemoteAddr() net.Addr {
 func (c *uuConn) SetDeadline(t time.Time) error      { return nil }
 func (c *uuConn) SetReadDeadline(t time.Time) error  { return nil }
 func (c *uuConn) SetWriteDeadline(t time.Time) error { return nil }
+
+// ─── uuPacketConn implements net.PacketConn over a UU session ───
+
+type uuPacketConn struct {
+	transport *Transport
+	sessionID uint16
+	dataCh    chan []byte
+	closed    atomic.Bool
+}
+
+func encodeAddressHeader(addr net.Addr) []byte {
+	var buf []byte
+	switch a := addr.(type) {
+	case *net.UDPAddr:
+		if a.IP.To4() != nil {
+			buf = make([]byte, 1+4+2)
+			buf[0] = 0x01
+			copy(buf[1:5], a.IP.To4())
+			binary.BigEndian.PutUint16(buf[5:7], uint16(a.Port))
+		} else {
+			buf = make([]byte, 1+16+2)
+			buf[0] = 0x04
+			copy(buf[1:17], a.IP.To16())
+			binary.BigEndian.PutUint16(buf[17:19], uint16(a.Port))
+		}
+	case M.Socksaddr:
+		if a.IsIPv4() {
+			buf = make([]byte, 1+4+2)
+			buf[0] = 0x01
+			copy(buf[1:5], a.Addr.AsSlice())
+			binary.BigEndian.PutUint16(buf[5:7], a.Port)
+		} else if a.IsIPv6() {
+			buf = make([]byte, 1+16+2)
+			buf[0] = 0x04
+			copy(buf[1:17], a.Addr.AsSlice())
+			binary.BigEndian.PutUint16(buf[17:19], a.Port)
+		} else if a.IsDomain() {
+			domainBytes := []byte(a.Fqdn)
+			buf = make([]byte, 1+1+len(domainBytes)+2)
+			buf[0] = 0x03
+			buf[1] = byte(len(domainBytes))
+			copy(buf[2:], domainBytes)
+			binary.BigEndian.PutUint16(buf[2+len(domainBytes):], a.Port)
+		}
+	}
+	return buf
+}
+
+func decodeAddressHeader(data []byte) (net.Addr, int) {
+	if len(data) < 7 {
+		return nil, 0
+	}
+	addrType := data[0]
+	var addr net.UDPAddr
+
+	switch addrType {
+	case 0x01: // IPv4
+		if len(data) < 7 {
+			return nil, 0
+		}
+		addr.IP = net.IPv4(data[1], data[2], data[3], data[4])
+		addr.Port = int(binary.BigEndian.Uint16(data[5:7]))
+		return &addr, 7
+	case 0x04: // IPv6
+		if len(data) < 19 {
+			return nil, 0
+		}
+		addr.IP = make(net.IP, 16)
+		copy(addr.IP, data[1:17])
+		addr.Port = int(binary.BigEndian.Uint16(data[17:19]))
+		return &addr, 19
+	case 0x03: // Domain
+		domainLen := int(data[1])
+		if len(data) < 2+domainLen+2 {
+			return nil, 0
+		}
+		addr.IP = net.ParseIP("0.0.0.0") // Placeholder since UDPAddr needs IP
+		addr.Port = int(binary.BigEndian.Uint16(data[2+domainLen : 2+domainLen+2]))
+		return &addr, 2 + domainLen + 2
+	}
+	return nil, 0
+}
+
+func (c *uuPacketConn) ReadFrom(p []byte) (n int, addr net.Addr, err error) {
+	data, ok := <-c.dataCh
+	if !ok || data == nil {
+		return 0, nil, io.EOF
+	}
+
+	c.transport.DeliverOrdered()
+
+	srcAddr, headerLen := decodeAddressHeader(data)
+	if headerLen == 0 || headerLen > len(data) {
+		return 0, nil, fmt.Errorf("uu: invalid udp address header")
+	}
+
+	n = copy(p, data[headerLen:])
+	return n, srcAddr, nil
+}
+
+func (c *uuPacketConn) WriteTo(p []byte, addr net.Addr) (n int, err error) {
+	if c.closed.Load() {
+		return 0, io.ErrClosedPipe
+	}
+
+	header := encodeAddressHeader(addr)
+	if header == nil {
+		return 0, fmt.Errorf("uu: unsupported address format")
+	}
+
+	chunk := make([]byte, 0, len(header)+len(p))
+	chunk = append(chunk, header...)
+	chunk = append(chunk, p...)
+
+	c.transport.SendData(c.sessionID, chunk)
+	return len(p), nil
+}
+
+func (c *uuPacketConn) Close() error {
+	if c.closed.CompareAndSwap(false, true) {
+		padding := make([]byte, 64+rand.Intn(1188-64))
+		rand.Read(padding)
+		c.transport.SendControl(c.sessionID, MsgClose, padding)
+		c.transport.CloseSession(c.sessionID)
+	}
+	return nil
+}
+
+func (c *uuPacketConn) LocalAddr() net.Addr                { return &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 0} }
+func (c *uuPacketConn) SetDeadline(t time.Time) error      { return nil }
+func (c *uuPacketConn) SetReadDeadline(t time.Time) error  { return nil }
+func (c *uuPacketConn) SetWriteDeadline(t time.Time) error { return nil }

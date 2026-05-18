@@ -21,6 +21,8 @@ const (
 	MsgAck     byte = 0x04 // Speed ack
 	MsgResend  byte = 0x05 // Request resend (list of lost seq)
 	MsgResendR byte = 0x06 // Resend response
+	MsgNewUDP  byte = 0x07 // New UDP session
+	MsgNewAck  byte = 0x08 // New session ACK (bypass sequencing)
 )
 
 // ─── Packet Wire Format ───
@@ -55,7 +57,7 @@ func DefaultLossConfig() LossConfig {
 		RetryBase:    0.45,
 		RetryMax:     3.0,
 		MaxRetry:     6,
-		SkipAfter:    8.0,
+		SkipAfter:    4.0,
 		BatchSize:    160,
 	}
 }
@@ -407,6 +409,15 @@ func (t *Transport) processPacket(data []byte) {
 	case MsgClose:
 		t.CloseSession(sessionID)
 
+	case MsgNewAck: // Connection handshake response — deliver directly, bypass sequencing
+		if ch, ok := t.sessions.Load(sessionID); ok {
+			dataCh := ch.(chan []byte)
+			select {
+			case dataCh <- payload:
+			default:
+			}
+		}
+
 	case MsgResend: // Server requesting us to resend
 		if len(payload) >= 4 {
 			delay := t.udpDelay.Load().(float64)
@@ -474,14 +485,44 @@ func (t *Transport) lossLoop() {
 		rxSeq := t.rxSeq.Load()
 		lastSeq := t.lastSeq.Load()
 		delay := t.udpDelay.Load().(float64)
+		now := time.Now()
 
 		if int64(rxSeq) < lastSeq {
-			now := time.Now()
 			grace := t.loss.RequestGrace
 			if g := delay * 80; g > grace {
 				grace = g
 			}
 			var resendList []byte
+
+			// Phase 1: Batch-skip all consecutive timed-out packets at head-of-line
+			skipCount := uint32(0)
+			for seq := rxSeq; int64(seq) < lastSeq; seq++ {
+				if _, exists := t.rxBuffer.Load(seq); exists {
+					break // found a packet, stop skipping
+				}
+				entry, tracked := loseSeq[seq]
+				if !tracked {
+					break // not even tracked as lost yet, stop
+				}
+				if now.Sub(entry.firstSeen).Seconds() < t.loss.SkipAfter {
+					break // not timed out yet, stop
+				}
+				skipCount++
+				delete(loseSeq, seq)
+			}
+			if skipCount > 0 {
+				t.rxMu.Lock()
+				curRxSeq := t.rxSeq.Load()
+				if curRxSeq == rxSeq {
+					t.rxSeq.Store(rxSeq + skipCount)
+					t.deliverOrderedLocked()
+				}
+				t.rxMu.Unlock()
+				rxSeq = t.rxSeq.Load()
+				fmt.Printf("[LossLoop] skipped %d stuck packets, rxSeq now %d\n", skipCount, rxSeq)
+			}
+
+			// Phase 2: Request retransmission for missing packets
 			for seq := rxSeq; int64(seq) < lastSeq; seq++ {
 				if _, exists := t.rxBuffer.Load(seq); exists {
 					continue
@@ -505,23 +546,9 @@ func (t *Transport) lossLoop() {
 				if retryCount > 0 && now.Sub(entry.lastSent).Seconds() < retryDelay {
 					continue
 				}
-				// --- 關鍵修正：將 Skip 檢查移到重試次數檢查之前 ---
-				if seq == rxSeq && now.Sub(entry.firstSeen).Seconds() >= t.loss.SkipAfter {
-					t.rxMu.Lock()
-					if t.rxSeq.Load() == seq {
-						t.rxSeq.Store(seq + 1)
-						delete(loseSeq, seq)
-						t.deliverOrderedLocked()
-					}
-					t.rxMu.Unlock()
-					rxSeq = t.rxSeq.Load()
-					continue
-				}
-
 				if retryCount >= t.loss.MaxRetry {
 					continue
 				}
-				// --- 結束修正 ---
 				buf := make([]byte, 4)
 				binary.BigEndian.PutUint32(buf, seq)
 				resendList = append(resendList, buf...)
