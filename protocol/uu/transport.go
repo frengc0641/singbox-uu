@@ -114,8 +114,10 @@ type Transport struct {
 
 	// State
 	connected atomic.Bool
-	stopCh    chan struct{}
-	rxRawCh   chan rawPacket
+	stopCh      chan struct{}
+	rxRawCh     chan rawPacket
+	lossNotify  chan struct{}
+	tokenNotify chan struct{}
 
 	// Stats
 	txBytes atomic.Uint64
@@ -149,9 +151,11 @@ func NewTransport(serverAddr string, password string, speed SpeedConfig, loss Lo
 		key:        DeriveKey(password),
 		speed:      speed,
 		loss:       loss,
-		stopCh:     make(chan struct{}),
-		rxRawCh:    make(chan rawPacket, 4096),
-		txTokens:   make(chan struct{}, speed.Windows*2),
+		stopCh:      make(chan struct{}),
+		rxRawCh:     make(chan rawPacket, 4096),
+		txTokens:    make(chan struct{}, speed.Windows*2),
+		lossNotify:  make(chan struct{}, 1),
+		tokenNotify: make(chan struct{}, 1),
 	}
 	t.lastSeq.Store(-1)
 	delay := float64(speed.MTU) / speed.InitSpeed * 8.0
@@ -284,6 +288,10 @@ func (t *Transport) encryptAndSend(seq uint32, sessionID uint16, msgType byte, p
 	if rateLimit {
 		select {
 		case <-t.txTokens:
+			select {
+			case t.tokenNotify <- struct{}{}:
+			default:
+			}
 		case <-t.stopCh:
 			return
 		}
@@ -319,7 +327,7 @@ func (t *Transport) recvLoop() {
 			return
 		default:
 		}
-		t.udpConn.SetReadDeadline(time.Now().Add(15 * time.Second))
+		t.udpConn.SetReadDeadline(time.Now().Add(90 * time.Second))
 		n, err := t.udpConn.Read(buf)
 		if err != nil {
 			if ne, ok := err.(net.Error); ok && ne.Timeout() {
@@ -399,6 +407,10 @@ func (t *Transport) processPacket(data []byte) {
 			old := t.lastSeq.Load()
 			if int64(seq) > old {
 				if t.lastSeq.CompareAndSwap(old, int64(seq)) {
+					select {
+					case t.lossNotify <- struct{}{}:
+					default:
+					}
 					break
 				}
 			} else {
@@ -476,19 +488,23 @@ func (t *Transport) lossLoop() {
 	loseSeq := make(map[uint32]*lossEntry)
 
 	for {
-		select {
-		case <-t.stopCh:
-			return
-		default:
-		}
-
 		rxSeq := t.rxSeq.Load()
 		lastSeq := t.lastSeq.Load()
+
+		if int64(rxSeq) >= lastSeq {
+			// IDLE STATE: No missing packets. Block completely to save battery.
+			select {
+			case <-t.stopCh:
+				return
+			case <-t.lossNotify:
+			}
+			continue
+		}
+
 		delay := t.udpDelay.Load().(float64)
 		now := time.Now()
 
-		if int64(rxSeq) < lastSeq {
-			grace := t.loss.RequestGrace
+		grace := t.loss.RequestGrace
 			if g := delay * 80; g > grace {
 				grace = g
 			}
@@ -576,14 +592,11 @@ func (t *Transport) lossLoop() {
 			if sleepDur > 0.2 {
 				sleepDur = 0.2
 			}
-			time.Sleep(time.Duration(sleepDur * float64(time.Second)))
-		} else {
-			sleepDur := delay * 10
-			if sleepDur < 0.05 {
-				sleepDur = 0.05
+			select {
+			case <-t.stopCh:
+				return
+			case <-time.After(time.Duration(sleepDur * float64(time.Second))):
 			}
-			time.Sleep(time.Duration(sleepDur * float64(time.Second)))
-		}
 	}
 }
 
@@ -591,14 +604,22 @@ func (t *Transport) lossLoop() {
 
 func (t *Transport) speedLoop() {
 	for {
+		// Block completely if tokens are full to save battery
+		if len(t.txTokens) >= t.speed.Windows {
+			select {
+			case <-t.stopCh:
+				return
+			case <-t.tokenNotify:
+			}
+		}
+
 		delay := t.udpDelay.Load().(float64)
 		sleepDur := delay * float64(t.speed.Windows)
-		time.Sleep(time.Duration(sleepDur * float64(time.Second)))
-
+		
 		select {
 		case <-t.stopCh:
 			return
-		default:
+		case <-time.After(time.Duration(sleepDur * float64(time.Second))):
 		}
 
 		// Refill tokens
@@ -629,7 +650,7 @@ func (t *Transport) statusLoop() {
 				// Try reconnect
 				t.reconnect()
 			}
-			if count >= 3 {
+			if count >= 10 { // 30 seconds
 				elapsed := time.Since(lastTime).Seconds()
 				txKB := float64(t.txBytes.Swap(0)) / elapsed / 1000
 				rxKB := float64(t.rxBytes.Swap(0)) / elapsed / 1000
